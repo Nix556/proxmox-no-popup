@@ -25,12 +25,22 @@ chmod +x install.sh
 ```bash
 ./install.sh install          # install popup removal
 ./install.sh uninstall        # remove and restore original
-./install.sh status           # show current state
+./install.sh status           # show current state and version check
 ./install.sh dry-run          # preview changes without applying
 ./install.sh cleanup [N]      # remove old backups, keep N (default: 3)
+./install.sh rollback <ts>    # restore specific backup by timestamp
+./install.sh backups          # list available backups
 ./install.sh log              # show recent log entries
 ./install.sh multi <nodes>    # install on multiple nodes via SSH
 ./install.sh version          # show version
+./install.sh --help           # show help
+```
+
+## Options
+
+```bash
+-q, --quiet    # suppress graphical output
+-h, --help     # show help message
 ```
 
 ## Multi-node install

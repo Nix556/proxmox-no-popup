@@ -1,8 +1,9 @@
 #!/bin/bash
-# Proxmox VE subscription popup remover v1.2.0
+# Proxmox VE subscription popup remover v1.3.0
 # Injects JS to suppress popup - doesn't modify core files
 
-VERSION="1.2.0"
+VERSION="1.3.0"
+VERSION_FILE="/usr/local/share/pve-nag-fix/.version"
 set -e
 
 # colors
@@ -147,6 +148,9 @@ install() {
     log "Backup created: $BACKUP_FILE"
     step_ok "Backing up template"
     
+    # save version
+    echo "$VERSION" > "$VERSION_FILE"
+    
     # create js file
     step "Creating JS interceptor"
     cat > "$JS_SOURCE" << 'EOF'
@@ -285,6 +289,19 @@ status() {
     if command -v pveversion &>/dev/null; then
         echo -e "  ${DIM}$(pveversion)${NC}"
         echo ""
+    fi
+    
+    # version check
+    if [[ -f "$VERSION_FILE" ]]; then
+        INSTALLED_VER=$(cat "$VERSION_FILE")
+        if [[ "$INSTALLED_VER" != "$VERSION" ]]; then
+            echo -e "  ${YELLOW}Update available: v$INSTALLED_VER -> v$VERSION${NC}"
+            echo -e "  ${DIM}Run: ./install.sh uninstall && ./install.sh install${NC}"
+            echo ""
+        else
+            echo -e "  ${GREEN}Installed version: v$INSTALLED_VER (up to date)${NC}"
+            echo ""
+        fi
     fi
     
     # components
@@ -431,6 +448,83 @@ multi_install() {
     echo ""
 }
 
+list_backups() {
+    header
+    echo -e "  ${BOLD}Available Backups${NC}"
+    echo ""
+    
+    if [[ ! -d "$BACKUP_DIR" ]] || [[ -z $(ls -A "$BACKUP_DIR"/*.bak 2>/dev/null) ]]; then
+        echo -e "  ${YELLOW}No backups found${NC}"
+        echo ""
+        return
+    fi
+    
+    echo -e "  ${DIM}Timestamp            Size${NC}"
+    echo -e "  ${DIM}─────────────────────────────${NC}"
+    ls -t "$BACKUP_DIR"/*.bak 2>/dev/null | while read f; do
+        local ts=$(basename "$f" | sed 's/index.html.tpl.\([0-9]*\).bak/\1/')
+        local size=$(du -h "$f" | cut -f1)
+        echo -e "  $ts    $size"
+    done
+    echo ""
+    echo -e "  ${DIM}Use: ./install.sh rollback <timestamp>${NC}"
+    echo ""
+}
+
+rollback() {
+    header
+    echo -e "  ${BOLD}Rollback${NC}"
+    echo ""
+    
+    check_root
+    local timestamp="$1"
+    
+    if [[ -z "$timestamp" ]]; then
+        echo -e "  ${YELLOW}Usage: $0 rollback <timestamp>${NC}"
+        echo ""
+        echo -e "  Available backups:"
+        ls -t "$BACKUP_DIR"/*.bak 2>/dev/null | while read f; do
+            local ts=$(basename "$f" | sed 's/index.html.tpl.\([0-9]*\).bak/\1/')
+            echo -e "    - $ts"
+        done
+        echo ""
+        exit 1
+    fi
+    
+    local backup_file="$BACKUP_DIR/index.html.tpl.${timestamp}.bak"
+    
+    if [[ ! -f "$backup_file" ]]; then
+        step_fail "Finding backup"
+        echo -e "  ${RED}Backup not found: $timestamp${NC}"
+        echo ""
+        echo -e "  Available backups:"
+        ls -t "$BACKUP_DIR"/*.bak 2>/dev/null | while read f; do
+            local ts=$(basename "$f" | sed 's/index.html.tpl.\([0-9]*\).bak/\1/')
+            echo -e "    - $ts"
+        done
+        echo ""
+        exit 1
+    fi
+    
+    step "Restoring from $timestamp"
+    cp "$backup_file" "$TEMPLATE"
+    log "Rolled back to backup: $backup_file"
+    step_ok "Restoring from $timestamp"
+    
+    step "Restarting pveproxy"
+    if systemctl is-active --quiet pveproxy 2>/dev/null; then
+        systemctl restart pveproxy
+    fi
+    step_ok "Restarting pveproxy"
+    
+    echo ""
+    echo -e "  ${GREEN}${BOLD}Rollback complete!${NC}"
+    echo -e "  ${DIM}Restored from: $backup_file${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Refresh your browser (Ctrl+Shift+R)${NC}"
+    echo ""
+}
+
 show_help() {
     header
     echo -e "  ${BOLD}Usage:${NC} $0 <command> [options]"
@@ -438,23 +532,38 @@ show_help() {
     echo -e "  ${BOLD}Commands:${NC}"
     echo -e "    install          Install popup removal"
     echo -e "    uninstall        Remove and restore original"
-    echo -e "    status           Show current state"
+    echo -e "    status           Show current state and version"
     echo -e "    dry-run          Preview changes"
     echo -e "    cleanup [N]      Remove old backups, keep N ${DIM}(default: 3)${NC}"
+    echo -e "    rollback <ts>    Restore specific backup by timestamp"
+    echo -e "    backups          List available backups"
     echo -e "    log              Show recent log entries"
     echo -e "    multi <nodes>    Install on multiple nodes via SSH"
     echo -e "    version          Show version"
     echo ""
+    echo -e "  ${BOLD}Options:${NC}"
+    echo -e "    -q, --quiet      Suppress graphical output"
+    echo -e "    -h, --help       Show this help message"
+    echo ""
     echo -e "  ${BOLD}Examples:${NC}"
     echo -e "    $0 install"
+    echo -e "    $0 install --quiet"
     echo -e "    $0 cleanup 5"
+    echo -e "    $0 rollback 20251202143022"
     echo -e "    $0 multi 10.0.0.1 10.0.0.2"
     echo ""
 }
 
-# handle --quiet flag for multi-node
-if [[ "$2" == "--quiet" ]]; then
-    # simplified output for remote execution
+# handle quiet mode globally
+QUIET=false
+for arg in "$@"; do
+    if [[ "$arg" == "--quiet" ]] || [[ "$arg" == "-q" ]]; then
+        QUIET=true
+        break
+    fi
+done
+
+if $QUIET; then
     header() { :; }
     step() { :; }
     step_ok() { :; }
@@ -467,8 +576,11 @@ case "${1:-}" in
     status) status ;;
     dry-run) dry_run ;;
     cleanup) cleanup_backups "${2:-3}" ;;
+    rollback) rollback "$2" ;;
+    backups) list_backups ;;
     log) show_log ;;
     multi) multi_install "$@" ;;
     version|-v|--version) echo "v$VERSION" ;;
+    -h|--help|help) show_help ;;
     *) show_help ;;
 esac
