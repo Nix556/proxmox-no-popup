@@ -1,10 +1,14 @@
 #!/bin/bash
-# Proxmox VE subscription popup remover v1.3.0
+# Proxmox VE subscription popup remover v1.4.0
 # Injects JS to suppress popup - doesn't modify core files
 
-VERSION="1.3.0"
+set -euo pipefail
+
+VERSION="1.4.0"
 VERSION_FILE="/usr/local/share/pve-nag-fix/.version"
-set -e
+
+# cleanup on error
+trap 'log "Script interrupted or failed"' ERR
 
 # colors
 RED='\033[0;31m'
@@ -29,6 +33,8 @@ CRON_FILE="/etc/cron.d/pve-nag-fix"
 BACKUP_DIR="/var/lib/pve-nag-fix-backups"
 LOG_FILE="/var/log/pve-nag-fix.log"
 SCRIPT_TAG='<script src="/pve2/js/no-popup.js"></script>'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GIT_INSTALLED_BY_SCRIPT=false
 
 # header
 header() {
@@ -60,20 +66,24 @@ step_fail() {
 
 # progress bar
 progress() {
-    local duration=$1
+    local duration=${1:-1}
     local steps=20
-    local delay=$(echo "scale=3; $duration / $steps" | bc 2>/dev/null || echo "0.05")
+    local delay
+    delay=$(awk "BEGIN {printf \"%.3f\", $duration / $steps}" 2>/dev/null || echo "0.05")
     
     echo -ne "  ["
     for ((i=0; i<steps; i++)); do
         echo -ne "${GREEN}#${NC}"
-        sleep $delay 2>/dev/null || true
+        sleep "$delay" 2>/dev/null || true
     done
     echo -e "] ${GREEN}Done${NC}"
 }
 
 # logging
 log() {
+    local log_dir
+    log_dir=$(dirname "$LOG_FILE")
+    [[ -d "$log_dir" ]] || mkdir -p "$log_dir" 2>/dev/null || true
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE" 2>/dev/null || true
 }
 
@@ -82,6 +92,33 @@ check_root() {
         step_fail "Root check"
         echo -e "  ${RED}Error: run as root${NC}"
         exit 1
+    fi
+}
+
+ensure_git() {
+    if ! command -v git &>/dev/null; then
+        step "Installing git"
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq git >/dev/null 2>&1
+        if command -v git &>/dev/null; then
+            GIT_INSTALLED_BY_SCRIPT=true
+            step_ok "Installing git"
+        else
+            step_fail "Installing git"
+            echo -e "  ${RED}Error: failed to install git${NC}"
+            exit 1
+        fi
+    fi
+}
+
+cleanup_after_install() {
+    # remove git if we installed it (keep the repo for other commands)
+    if $GIT_INSTALLED_BY_SCRIPT; then
+        step "Removing git (auto-installed)"
+        apt-get remove -y -qq git >/dev/null 2>&1 || true
+        apt-get autoremove -y -qq >/dev/null 2>&1 || true
+        step_ok "Removing git (auto-installed)"
+        log "Removed git (was installed by script)"
     fi
 }
 
@@ -116,18 +153,27 @@ already_installed() {
     grep -q "no-popup.js" "$TEMPLATE" 2>/dev/null
 }
 
+verify_integrity() {
+    # verify all components are properly installed
+    [[ -f "$JS_SOURCE" ]] && \
+    [[ -L "$JS_LINK" ]] && \
+    [[ -f "$CRON_FILE" ]] && \
+    grep -q "no-popup.js" "$TEMPLATE" 2>/dev/null
+}
+
 install() {
     header
     echo -e "  ${BOLD}Installing...${NC}"
     echo ""
     
     check_root
+    ensure_git
     check_proxmox
     
     if already_installed; then
         echo ""
         echo -e "  ${YELLOW}Already installed.${NC}"
-        echo -e "  Run ${BOLD}./install.sh uninstall${NC} first to reinstall."
+        echo -e "  Run ${BOLD}./pve-nag-fix.sh uninstall${NC} first to reinstall."
         echo ""
         exit 0
     fi
@@ -139,6 +185,16 @@ install() {
     mkdir -p /usr/local/share/pve-nag-fix
     mkdir -p "$BACKUP_DIR"
     step_ok "Creating directories"
+    progress 0.3
+    
+    # check disk space (need at least 1MB free)
+    local free_space
+    free_space=$(df -k "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
+    if [[ "$free_space" -lt 1024 ]]; then
+        step_fail "Disk space check"
+        echo -e "  ${RED}Error: insufficient disk space${NC}"
+        exit 1
+    fi
     
     # backup template
     step "Backing up template"
@@ -176,6 +232,7 @@ EOF
         exit 1
     fi
     step_ok "Creating JS interceptor"
+    progress 0.5
     
     # symlink
     step "Creating symlink"
@@ -200,6 +257,7 @@ EOF
         exit 1
     fi
     step_ok "Patching template"
+    progress 0.4
     
     # cron job
     step "Setting up cron"
@@ -215,6 +273,7 @@ EOF
 DPkg::Post-Invoke { "[ -f $JS_SOURCE ] && ln -sf $JS_SOURCE $JS_LINK 2>/dev/null || true"; };
 EOF
     step_ok "Setting up APT hook"
+    progress 0.3
     
     # restart pveproxy
     step "Restarting pveproxy"
@@ -222,8 +281,20 @@ EOF
         systemctl restart pveproxy
     fi
     step_ok "Restarting pveproxy"
+    progress 0.5
     
-    log "Install completed successfully"
+    # verify installation
+    step "Verifying installation"
+    if verify_integrity; then
+        step_ok "Verifying installation"
+        log "Install completed successfully - all components verified"
+    else
+        step_fail "Verifying installation"
+        log "WARNING: Install completed but verification failed"
+    fi
+    
+    # cleanup installation files
+    cleanup_after_install
     
     echo ""
     echo -e "  ${GREEN}${BOLD}Installation complete!${NC}"
@@ -241,6 +312,18 @@ uninstall() {
     echo ""
     
     check_root
+    
+    # confirm unless quiet mode
+    if ! $QUIET && [[ -t 0 ]]; then
+        echo -ne "  ${YELLOW}Are you sure? [y/N]:${NC} "
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "  ${DIM}Cancelled${NC}"
+            exit 0
+        fi
+        echo ""
+    fi
+    
     log "Starting uninstall"
     
     # restore template
@@ -255,6 +338,7 @@ uninstall() {
         fi
     fi
     step_ok "Restoring template"
+    progress 0.4
     
     # remove files
     step "Removing files"
@@ -263,6 +347,7 @@ uninstall() {
     rm -f "$CRON_FILE"
     rm -f /etc/apt/apt.conf.d/99-pve-nag-fix
     step_ok "Removing files"
+    progress 0.5
     
     # restart
     step "Restarting pveproxy"
@@ -270,6 +355,7 @@ uninstall() {
         systemctl restart pveproxy
     fi
     step_ok "Restarting pveproxy"
+    progress 0.3
     
     log "Uninstall completed"
     
@@ -296,7 +382,7 @@ status() {
         INSTALLED_VER=$(cat "$VERSION_FILE")
         if [[ "$INSTALLED_VER" != "$VERSION" ]]; then
             echo -e "  ${YELLOW}Update available: v$INSTALLED_VER -> v$VERSION${NC}"
-            echo -e "  ${DIM}Run: ./install.sh uninstall && ./install.sh install${NC}"
+            echo -e "  ${DIM}Run: ./pve-nag-fix.sh uninstall && ./pve-nag-fix.sh install${NC}"
             echo ""
         else
             echo -e "  ${GREEN}Installed version: v$INSTALLED_VER (up to date)${NC}"
@@ -304,13 +390,55 @@ status() {
         fi
     fi
     
-    # components
+    # components with health score
+    local health=0
+    local total=5
+    
     echo -e "  ${BOLD}Components:${NC}"
-    [[ -f "$JS_SOURCE" ]] && echo -e "    ${CHECK} JS file" || echo -e "    ${CROSS} JS file"
-    [[ -L "$JS_LINK" ]] && echo -e "    ${CHECK} Symlink" || echo -e "    ${CROSS} Symlink"
-    grep -q "no-popup.js" "$TEMPLATE" 2>/dev/null && echo -e "    ${CHECK} Template patched" || echo -e "    ${CROSS} Template not patched"
-    [[ -f "$CRON_FILE" ]] && echo -e "    ${CHECK} Cron job" || echo -e "    ${CROSS} Cron job"
-    [[ -f "/etc/apt/apt.conf.d/99-pve-nag-fix" ]] && echo -e "    ${CHECK} APT hook" || echo -e "    ${CROSS} APT hook"
+    if [[ -f "$JS_SOURCE" ]]; then
+        echo -e "    ${CHECK} JS file"
+        ((health++)) || true
+    else
+        echo -e "    ${CROSS} JS file"
+    fi
+    
+    if [[ -L "$JS_LINK" ]]; then
+        echo -e "    ${CHECK} Symlink"
+        ((health++)) || true
+    else
+        echo -e "    ${CROSS} Symlink"
+    fi
+    
+    if grep -q "no-popup.js" "$TEMPLATE" 2>/dev/null; then
+        echo -e "    ${CHECK} Template patched"
+        ((health++)) || true
+    else
+        echo -e "    ${CROSS} Template not patched"
+    fi
+    
+    if [[ -f "$CRON_FILE" ]]; then
+        echo -e "    ${CHECK} Cron job"
+        ((health++)) || true
+    else
+        echo -e "    ${CROSS} Cron job"
+    fi
+    
+    if [[ -f "/etc/apt/apt.conf.d/99-pve-nag-fix" ]]; then
+        echo -e "    ${CHECK} APT hook"
+        ((health++)) || true
+    else
+        echo -e "    ${CROSS} APT hook"
+    fi
+    
+    # show health score
+    echo ""
+    if [[ $health -eq $total ]]; then
+        echo -e "  ${GREEN}Health: $health/$total (Healthy)${NC}"
+    elif [[ $health -gt 0 ]]; then
+        echo -e "  ${YELLOW}Health: $health/$total (Degraded)${NC}"
+    else
+        echo -e "  ${DIM}Health: Not installed${NC}"
+    fi
     
     # backups
     if [[ -d "$BACKUP_DIR" ]]; then
@@ -425,7 +553,7 @@ multi_install() {
         
         # copy script
         step "  Copying script"
-        if ! scp -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$script_path" "root@$node:/tmp/install.sh" 2>/dev/null; then
+        if ! scp -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$script_path" "root@$node:/tmp/pve-nag-fix.sh" 2>/dev/null; then
             step_fail "  Copying script"
             continue
         fi
@@ -433,7 +561,7 @@ multi_install() {
         
         # run install
         step "  Running install"
-        if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "root@$node" "chmod +x /tmp/install.sh && /tmp/install.sh install --quiet" 2>/dev/null; then
+        if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "root@$node" "chmod +x /tmp/pve-nag-fix.sh && /tmp/pve-nag-fix.sh install --quiet" 2>/dev/null; then
             step_ok "  Running install"
             log "Multi-install: $node succeeded"
         else
@@ -467,7 +595,7 @@ list_backups() {
         echo -e "  $ts    $size"
     done
     echo ""
-    echo -e "  ${DIM}Use: ./install.sh rollback <timestamp>${NC}"
+    echo -e "  ${DIM}Use: ./pve-nag-fix.sh rollback <timestamp>${NC}"
     echo ""
 }
 
@@ -525,6 +653,109 @@ rollback() {
     echo ""
 }
 
+repair() {
+    header
+    echo -e "  ${BOLD}Repair Installation${NC}"
+    echo ""
+    
+    check_root
+    check_proxmox
+    log "Starting repair"
+    
+    local fixed=0
+    
+    # ensure directories exist
+    mkdir -p /usr/local/share/pve-nag-fix 2>/dev/null
+    mkdir -p "$BACKUP_DIR" 2>/dev/null
+    
+    # fix JS file if missing
+    if [[ ! -f "$JS_SOURCE" ]]; then
+        step "Recreating JS file"
+        cat > "$JS_SOURCE" << 'EOF'
+(function() {
+    function patchPopup() {
+        if (typeof Ext === 'undefined' || typeof Ext.Msg === 'undefined') {
+            setTimeout(patchPopup, 100);
+            return;
+        }
+        var origShow = Ext.Msg.show;
+        Ext.Msg.show = function(c) {
+            if (c && c.title && c.title.indexOf('No valid subscription') !== -1) return;
+            return origShow.apply(this, arguments);
+        };
+    }
+    patchPopup();
+})();
+EOF
+        chmod 644 "$JS_SOURCE"
+        step_ok "Recreating JS file"
+        ((fixed++)) || true
+    fi
+    
+    # fix symlink if missing/broken
+    if [[ ! -L "$JS_LINK" ]] || [[ ! -e "$JS_LINK" ]]; then
+        step "Fixing symlink"
+        ln -sf "$JS_SOURCE" "$JS_LINK"
+        step_ok "Fixing symlink"
+        ((fixed++)) || true
+    fi
+    
+    # fix template if not patched
+    if ! grep -q "no-popup.js" "$TEMPLATE" 2>/dev/null; then
+        step "Patching template"
+        if grep -q "</head>" "$TEMPLATE"; then
+            sed -i "s|</head>|$SCRIPT_TAG\n</head>|" "$TEMPLATE"
+            step_ok "Patching template"
+            ((fixed++)) || true
+        else
+            step_fail "Patching template"
+        fi
+    fi
+    
+    # fix cron if missing
+    if [[ ! -f "$CRON_FILE" ]]; then
+        step "Recreating cron job"
+        cat > "$CRON_FILE" << EOF
+@reboot root sleep 30 && ln -sf $JS_SOURCE $JS_LINK 2>/dev/null
+EOF
+        chmod 644 "$CRON_FILE"
+        step_ok "Recreating cron job"
+        ((fixed++)) || true
+    fi
+    
+    # fix APT hook if missing
+    if [[ ! -f "/etc/apt/apt.conf.d/99-pve-nag-fix" ]]; then
+        step "Recreating APT hook"
+        cat > /etc/apt/apt.conf.d/99-pve-nag-fix << EOF
+DPkg::Post-Invoke { "[ -f $JS_SOURCE ] && ln -sf $JS_SOURCE $JS_LINK 2>/dev/null || true"; };
+EOF
+        step_ok "Recreating APT hook"
+        ((fixed++)) || true
+    fi
+    
+    # restart pveproxy if we fixed something
+    if [[ $fixed -gt 0 ]]; then
+        step "Restarting pveproxy"
+        if systemctl is-active --quiet pveproxy 2>/dev/null; then
+            systemctl restart pveproxy
+        fi
+        step_ok "Restarting pveproxy"
+        progress 0.5
+    fi
+    
+    log "Repair completed - fixed $fixed component(s)"
+    
+    echo ""
+    if [[ $fixed -gt 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}Repair complete!${NC} Fixed $fixed component(s)"
+        echo ""
+        echo -e "  ${YELLOW}Refresh your browser (Ctrl+Shift+R)${NC}"
+    else
+        echo -e "  ${GREEN}All components OK, nothing to repair${NC}"
+    fi
+    echo ""
+}
+
 show_help() {
     header
     echo -e "  ${BOLD}Usage:${NC} $0 <command> [options]"
@@ -532,7 +763,8 @@ show_help() {
     echo -e "  ${BOLD}Commands:${NC}"
     echo -e "    install          Install popup removal"
     echo -e "    uninstall        Remove and restore original"
-    echo -e "    status           Show current state and version"
+    echo -e "    status           Show current state and health"
+    echo -e "    repair           Fix degraded installation"
     echo -e "    dry-run          Preview changes"
     echo -e "    cleanup [N]      Remove old backups, keep N ${DIM}(default: 3)${NC}"
     echo -e "    rollback <ts>    Restore specific backup by timestamp"
@@ -548,6 +780,7 @@ show_help() {
     echo -e "  ${BOLD}Examples:${NC}"
     echo -e "    $0 install"
     echo -e "    $0 install --quiet"
+    echo -e "    $0 repair"
     echo -e "    $0 cleanup 5"
     echo -e "    $0 rollback 20251202143022"
     echo -e "    $0 multi 10.0.0.1 10.0.0.2"
@@ -568,15 +801,17 @@ if $QUIET; then
     step() { :; }
     step_ok() { :; }
     step_fail() { echo "FAILED: $1"; }
+    progress() { :; }
 fi
 
 case "${1:-}" in
     install) install ;;
     uninstall|remove) uninstall ;;
     status) status ;;
+    repair|fix) repair ;;
     dry-run) dry_run ;;
     cleanup) cleanup_backups "${2:-3}" ;;
-    rollback) rollback "$2" ;;
+    rollback) rollback "${2:-}" ;;
     backups) list_backups ;;
     log) show_log ;;
     multi) multi_install "$@" ;;
